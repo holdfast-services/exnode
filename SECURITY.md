@@ -2,7 +2,8 @@
 
 ## Reporting a vulnerability
 
-Email **security@holdfast.services**. Include the version you ran (`exnode --version`), the steps
+Email **security@holdfast.services**, or use **Report a vulnerability** on this repository's
+Security tab. Include the version you ran (`exnode --version`), the steps
 that show the problem, and what an attacker could do with it.
 
 Please do not open a public issue or pull request for a vulnerability. Keep the details private

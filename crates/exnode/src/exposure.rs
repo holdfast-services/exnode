@@ -96,7 +96,7 @@ mod tests {
             assert!(!ollama_host_is_exposed(safe), "{safe}");
         }
         for open in ["0.0.0.0", "0.0.0.0:11434", "http://0.0.0.0:11434", ":11434", "::", "[::]:11434",
-                     "192.168.1.20:11434", "https://ollama.lan:443", "myhost"] {
+                     "192.0.2.20:11434", "https://ollama.lan:443", "myhost"] {
             assert!(ollama_host_is_exposed(open), "{open}");
         }
     }
