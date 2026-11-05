@@ -1,0 +1,6 @@
+/target
+/target-*/
+.env
+*.key
+# A local node config at the root. packaging/node.toml is the shipped template.
+/node.toml

@@ -1,0 +1,91 @@
+# exnode.service: the Inference Exchange node agent, sandboxed.
+#
+# exnode needs very little: read /etc/exnode/node.toml and its key in
+# /var/lib/exnode, and open outbound TCP connections to the hub and to the
+# backend on 127.0.0.1.  It never listens on a port, never opens a GPU, and
+# reads models only through the backend's HTTP API.  Everything else is taken
+# away.  Inspect the result with:  systemd-analyze security exnode.service
+#
+# Put local changes in a drop-in (systemctl edit exnode), not in this file:
+# install.sh replaces it on upgrade.
+
+[Unit]
+Description=Inference Exchange node agent
+Wants=network-online.target
+After=network-online.target ollama.service
+# Nothing to run until the node is enrolled (exnode init --token ...).
+ConditionPathExists=/var/lib/exnode/node.key
+
+[Service]
+Type=exec
+User=exnode
+Group=exnode
+ExecStart=/usr/local/bin/exnode run --config /etc/exnode/node.toml
+WorkingDirectory=/var/lib/exnode
+Environment=RUST_LOG=exnode=info
+# Optional root-only (0600) file for secrets, such as the variable that
+# backend_api_key_env names.  systemd reads it before dropping privileges.
+EnvironmentFile=-/etc/exnode/exnode.env
+Restart=on-failure
+RestartSec=10s
+# 78: a safety check refused to serve (a vulnerable or exposed backend).
+# Restarting cannot fix that.  Fix the backend, then: systemctl restart exnode
+RestartPreventExitStatus=78
+UMask=0077
+
+# Filesystem: everything read-only, the state directory writable, homes and
+# temp private.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/exnode
+# Model weights stay behind the backend's API: hide the usual places they live
+# (homes, so ~/.ollama and ~/.cache/huggingface, are already gone).  Keep in
+# step with MODEL_DIRS in crates/exnode/src/checks.rs.  Add your own in a
+# drop-in:  [Service]  InaccessiblePaths=-/data/models
+InaccessiblePaths=-/usr/share/ollama -/var/lib/ollama -/var/lib/docker -/var/lib/containers
+InaccessiblePaths=-/opt/models -/srv/models -/var/lib/models
+
+# Devices: PrivateDevices=yes.  exnode never touches a GPU.  The backend
+# (Ollama, llama.cpp, vLLM) opens /dev/nvidia* or /dev/dri in its own service,
+# and exnode only speaks HTTP to it.  `nvidia-ctk --version`, which the safety
+# checks run, opens no device either.  Leave this on even on a GPU machine.
+PrivateDevices=yes
+DevicePolicy=closed
+
+# Privileges: none to start with, and no way to gain any.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+RemoveIPC=yes
+KeyringMode=private
+ProtectProc=invisible
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+# Not ProcSubset=pid: the exposure check reads /proc/net/tcp and tcp6.
+
+# Network: outbound TCP over IPv4 and IPv6 (hub, backend, DNS).  No AF_UNIX:
+# logs reach the journal through stdout, which systemd opens for us.  A glibc
+# build that resolves names through nss-resolve would need AF_UNIX added; the
+# released static musl binary does not.
+RestrictAddressFamilies=AF_INET AF_INET6
+
+# System calls: the system-service set, without the privileged and resource
+# groups.  EPERM rather than a kill, so a stray call fails softly.  (Go's
+# runtime in nvidia-ctk tries setrlimit and ignores the refusal.)
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

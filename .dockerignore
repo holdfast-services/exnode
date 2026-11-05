@@ -1,0 +1,10 @@
+# Build context for the exnode image (crates/exnode/Dockerfile).
+target/
+target-*/
+.env
+*.key
+node.toml
+*.db
+*.db-shm
+*.db-wal
+*.jsonl

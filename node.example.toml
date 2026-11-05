@@ -1,0 +1,51 @@
+# exnode configuration. Copy to node.toml and fill in your values.
+# Every key can be overridden with an EXNODE_ environment variable,
+# e.g. EXNODE_HUB_URL=https://hub.example.com
+
+# Hub URL (no trailing slash)
+hub_url = "http://127.0.0.1:8000"
+
+# Private key from `exnode init --key-out node.key`. Must be mode 0600.
+key_file = "node.key"
+
+# First run only: the one-time enrollment token from the console.
+# Prefer passing it as EXNODE_ENROLL_TOKEN=qd_reg_... instead of saving it here.
+# enroll_token = ""
+
+# Local inference backend: "ollama" or "openai" (vLLM, llama.cpp llama-server,
+# SGLang, or any other OpenAI-compatible server). Must be on this machine.
+backend     = "ollama"
+backend_url = "http://127.0.0.1:11434"
+# Name of an environment variable holding the backend's API key, if it needs one.
+# backend_api_key_env = "BACKEND_API_KEY"
+
+# Heartbeat interval (seconds). The console marks a node stale after 45 s.
+heartbeat_secs = 15
+
+# Long-poll timeout for job requests (seconds; the hub caps it at 30)
+poll_secs = 20
+
+# Maximum concurrent inference jobs
+max_concurrency = 2
+
+# Models to advertise and serve. "name" must match the backend's model name.
+# "hash" is fetched from Ollama when empty; the openai backend requires it.
+# Your trust tier is set by the hub, not here.
+#
+# "context" is the window, in tokens, each job runs in (default 4096). The hub
+# sends a node only jobs whose prompt estimate plus max_tokens fit it. With
+# Ollama it is sent as options.num_ctx on every request, so it also sets how
+# much memory the model loads with. An OpenAI-compatible server's window is its
+# own launch setting (vLLM --max-model-len, llama.cpp --ctx-size per slot):
+# advertise no more than that. A job that overflows anyway is refused, never
+# truncated, and the hub re-sends it to a node with a larger window.
+
+[[models]]
+name    = "qwen3:30b"
+context = 32768
+
+# Example for an OpenAI-compatible server:
+# [[models]]
+# name    = "Qwen3.8-Flash-Next"
+# hash    = "sha256:<digest of the weights you serve>"
+# context = 32768

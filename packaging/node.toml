@@ -1,0 +1,27 @@
+# /etc/exnode/node.toml: exnode as a systemd service.  Every key is explained
+# in node.example.toml.  This file is root:exnode, mode 0640: the agent can
+# read it and cannot change it.  It holds no secret: enroll with
+# `exnode init --token ...` (the token is never saved), and put a backend API
+# key in /etc/exnode/exnode.env (root, 0600).
+
+# The hub to serve, https only.  Required: the agent will not start without it.
+hub_url = ""
+
+key_file = "/var/lib/exnode/node.key"
+
+# "ollama", or "openai" for llama.cpp's llama-server, vLLM or SGLang.  The
+# backend must listen on 127.0.0.1 only: the agent refuses one it can see
+# listening on any other address.
+backend     = "ollama"
+backend_url = "http://127.0.0.1:11434"
+# backend_api_key_env = "BACKEND_API_KEY"
+
+heartbeat_secs  = 15
+poll_secs       = 20
+max_concurrency = 2
+
+# One block per model, "name" exactly as the backend knows it.  With the
+# openai backend, also set "hash" (sha256:<digest of the weights you serve>).
+[[models]]
+name    = "qwen3:30b"
+context = 32768
