@@ -1,0 +1,90 @@
+# CI: tests, and a dry run of the release build on every pull request and on
+# main.  It builds each release target twice, on two runners, with the same
+# script the release workflow uses, and fails unless the builds match.  It
+# never signs or publishes, so it needs only read access and no OIDC token.
+
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions: {}
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the Rust toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+      - run: cargo test --workspace --locked
+      - name: Shell scripts parse
+        run: |
+          sh -n scripts/install.sh
+          sh -n scripts/build-release.sh
+
+  build:
+    name: build (${{ matrix.target }}, ${{ matrix.builder }})
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        target: [x86_64-unknown-linux-musl, aarch64-unknown-linux-musl]
+        builder: [a, b]
+    env:
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the Rust toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+      - name: Install zig and cargo-zigbuild (exact versions, hash-pinned)
+        run: |
+          python3 -m venv "$RUNNER_TEMP/zig"
+          "$RUNNER_TEMP/zig/bin/pip" install --no-deps --require-hashes --only-binary :all: \
+            -r scripts/zig-requirements.txt
+          echo "$RUNNER_TEMP/zig/bin" >> "$GITHUB_PATH"
+      - name: Build (reproducible, static)
+        run: |
+          sh scripts/build-release.sh "$TARGET" dist
+          sha256sum "dist/exnode-$TARGET" | tee "dist/exnode-$TARGET.sha256"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sha256-${{ matrix.target }}-${{ matrix.builder }}
+          path: dist/exnode-${{ matrix.target }}.sha256
+          if-no-files-found: error
+          retention-days: 3
+
+  reproducible:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions: {}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: sha256-*
+          path: sums
+      - name: Both builds of each target must match
+        run: |
+          for t in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+            a=$(cut -d' ' -f1 "sums/sha256-$t-a/exnode-$t.sha256")
+            b=$(cut -d' ' -f1 "sums/sha256-$t-b/exnode-$t.sha256")
+            echo "$t a=$a b=$b"
+            [ "$a" = "$b" ] || { echo "::error::exnode-$t is not reproducible"; exit 1; }
+          done

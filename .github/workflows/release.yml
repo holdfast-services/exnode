@@ -1,22 +1,32 @@
-# Release exnode: static musl binaries for x86_64 and aarch64 Linux, built with
-# a pinned toolchain from Cargo.lock, checksummed, signed keylessly with
-# Sigstore cosign, attested with SLSA build provenance and published to GitHub
-# Releases with the packaging files and a stamped install.sh.
+# Release exnode: static musl binaries for x86_64 and aarch64 Linux, built
+# reproducibly from Cargo.lock with the toolchain in rust-toolchain.toml,
+# checksummed, signed keylessly with Sigstore cosign, attested with SLSA build
+# provenance and published to GitHub Releases with the packaging files and a
+# stamped install.sh.
 #
 # Every action is pinned to a full commit SHA (tag in the comment), resolved
 # with `git ls-remote` on 2026-11-04.  zig and cargo-zigbuild come from PyPI
-# by exact version and sha256.  No caches: a release must not build from state
-# a pull request could have written.
+# by exact version and sha256 (scripts/zig-requirements.txt).  No caches: a
+# release must not build from state a pull request could have written.
+#
+# Reproducible: each target is built twice, on two separate runners, by
+# scripts/build-release.sh.  The sign job refuses to sign unless both builds
+# are byte-identical.  A host can rebuild a tag with ex_release_rebuild
+# (scripts/release-check.fish) and get the same SHA256SUMS lines.
 #
 # Jobs and their permissions:
-#   build    contents: read                            compile one target
-#   sign     id-token: write, attestations: write      cosign + provenance (no repo write)
-#   publish  contents: write                           create the release (no OIDC token)
+#   build    contents: read                            compile one target, twice
+#   sign     id-token: write, attestations: write      compare, cosign + provenance (no repo write)
+#   publish  contents: write, environment "release"    create the release (no OIDC token)
 #
-# Not verified offline (this workflow has not run yet):
-#   - that zig 0.17.0 + cargo-zigbuild 0.24.1 link ring for aarch64-musl
-#     (cargo-zigbuild's own CI tests zig 0.17.0)
-#   - that python3 -m venv works on the ubuntu-24.04 runner image
+# Tags with a suffix (v0.1.0-rc.1) publish as GitHub pre-releases, which
+# /releases/latest and so install.sh's default never pick.
+#
+# Checked locally on 2026-11-25 (not on a GitHub runner):
+#   - zig 0.17.0 + cargo-zigbuild 0.24.1 link both targets, including ring for
+#     aarch64-musl; both binaries are static
+#   - builds are byte-identical across source paths and CARGO_HOMEs
+# Not verified until the workflow first runs:
 #   - the inputs of actions at these SHAs (written against their documented
 #     inputs; upload-artifact v7 / download-artifact v8 interoperate)
 #   - attestations on a private repository need a plan that supports them
@@ -35,12 +45,11 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  RUST_TOOLCHAIN: "1.97.0"
   CARGO_TERM_COLOR: never
 
 jobs:
   build:
-    name: build (${{ matrix.target }})
+    name: build (${{ matrix.target }}, ${{ matrix.builder }})
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -48,6 +57,7 @@ jobs:
       fail-fast: true
       matrix:
         target: [x86_64-unknown-linux-musl, aarch64-unknown-linux-musl]
+        builder: [a, b]
     env:
       TARGET: ${{ matrix.target }}
     steps:
@@ -55,10 +65,10 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
+      - name: Install the Rust toolchain from rust-toolchain.toml
         run: |
-          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --target "$TARGET"
-          echo "RUSTUP_TOOLCHAIN=$RUST_TOOLCHAIN" >> "$GITHUB_ENV"
+          rustup toolchain install
+          rustc --version
 
       - name: Tag matches the crate version
         run: |
@@ -69,28 +79,20 @@ jobs:
       - name: Install zig and cargo-zigbuild (exact versions, hash-pinned)
         run: |
           python3 -m venv "$RUNNER_TEMP/zig"
-          cat > "$RUNNER_TEMP/zig.txt" <<'EOF'
-          ziglang==0.17.0 --hash=sha256:97079827064a7492cce5541ceb438ae8003ce1e54e399676da2d62fb7a5dc08b
-          cargo-zigbuild==0.24.1 --hash=sha256:238a1ab54a95053a4eadc34775c81f795a8ad75f80bfed63f3f445f518102375
-          EOF
-          "$RUNNER_TEMP/zig/bin/pip" install --no-deps --require-hashes --only-binary :all: -r "$RUNNER_TEMP/zig.txt"
+          "$RUNNER_TEMP/zig/bin/pip" install --no-deps --require-hashes --only-binary :all: \
+            -r scripts/zig-requirements.txt
           echo "$RUNNER_TEMP/zig/bin" >> "$GITHUB_PATH"
 
-      - name: Build
-        run: cargo zigbuild --release --locked -p exnode --target "$TARGET"
-
-      - name: Check the binary is static
+      - name: Build (reproducible, static)
         run: |
-          bin="target/$TARGET/release/exnode"
-          file "$bin"
-          file "$bin" | grep -Eq 'statically linked|static-pie linked' \
-            || { echo "::error::$bin is not statically linked"; exit 1; }
-          if [ "$TARGET" = x86_64-unknown-linux-musl ]; then "$bin" --version; fi
-          mkdir -p dist && cp "$bin" "dist/exnode-$TARGET"
+          sh scripts/build-release.sh "$TARGET" dist
+          file "dist/exnode-$TARGET"
+          sha256sum "dist/exnode-$TARGET"
+          if [ "$TARGET" = x86_64-unknown-linux-musl ]; then "dist/exnode-$TARGET" --version; fi
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: exnode-${{ matrix.target }}
+          name: exnode-${{ matrix.target }}-${{ matrix.builder }}
           path: dist/exnode-${{ matrix.target }}
           if-no-files-found: error
           retention-days: 3
@@ -109,9 +111,25 @@ jobs:
 
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          pattern: exnode-*-linux-musl
+          pattern: exnode-*-linux-musl-a
           path: dist
           merge-multiple: true
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: exnode-*-linux-musl-b
+          path: rebuild
+          merge-multiple: true
+
+      - name: Both independent builds must be byte-identical
+        run: |
+          for t in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+            a=$(sha256sum "dist/exnode-$t" | cut -d' ' -f1)
+            b=$(sha256sum "rebuild/exnode-$t" | cut -d' ' -f1)
+            echo "$t a=$a b=$b"
+            [ "$a" = "$b" ] || { echo "::error::exnode-$t is not reproducible; not signing"; exit 1; }
+          done
+          rm -rf rebuild
 
       - name: Assemble the release files and SHA256SUMS
         env:
@@ -171,6 +189,9 @@ jobs:
   publish:
     needs: sign
     runs-on: ubuntu-24.04
+    # Add a required reviewer to this environment (Settings, Environments) so a
+    # pushed tag signs and attests but waits for a person before it publishes.
+    environment: release
     permissions:
       contents: write     # create the GitHub Release and upload its assets
     steps:
@@ -195,6 +216,9 @@ jobs:
                 --certificate-oidc-issuer https://token.actions.githubusercontent.com SHA256SUMS
               sha256sum -c --ignore-missing SHA256SUMS
               gh attestation verify exnode-x86_64-unknown-linux-musl --repo $REPO
+
+          Rebuild it yourself (byte-identical): from a checkout,
+          \`source scripts/release-check.fish; ex_release_rebuild $REPO $TAG\`.
           EOF
           prerelease=""
           case "$TAG" in *-*) prerelease="--prerelease" ;; esac
