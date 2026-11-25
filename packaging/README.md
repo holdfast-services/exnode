@@ -53,7 +53,8 @@ gh attestation verify exnode-$arch-unknown-linux-musl --repo "$repo"   # build p
 
 Each file also has its own `.sigstore.json` bundle, if you only want one.
 From a checkout, `source scripts/release-check.fish` and then `ex_release_check holdfast-services/exnode vX.Y.Z`
-does all of this in a temp directory.
+does all of this in a temp directory, and `ex_release_rebuild holdfast-services/exnode vX.Y.Z`
+rebuilds both binaries from the tagged source and checks they match the signed checksums.
 
 **3. Install** the binary, the system user, the directories and the unit:
 

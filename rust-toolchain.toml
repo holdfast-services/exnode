@@ -1,0 +1,6 @@
+# The release toolchain.  Release builds are only reproducible with this exact
+# version; scripts/build-release.sh and the release workflow both use it.
+[toolchain]
+channel = "1.97.0"
+profile = "minimal"
+targets = ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"]

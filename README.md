@@ -52,9 +52,19 @@ ex_release_check holdfast-services/exnode vX.Y.Z
 The same checks with plain `cosign`, `sha256sum` and `gh` are in
 [packaging/README.md](packaging/README.md).
 
+Builds are reproducible: the workflow builds each binary twice on separate runners and signs
+only if both match. To rebuild a release yourself and compare it byte for byte with the signed
+checksums (needs `git`, `rustup`, `python3` and `cosign`):
+
+```fish
+source scripts/release-check.fish
+ex_release_rebuild holdfast-services/exnode vX.Y.Z
+```
+
 ## Building from source
 
-The agent needs Rust 1.97 or newer.
+The agent needs Rust 1.97 or newer. Release binaries use the exact toolchain in
+`rust-toolchain.toml` and `scripts/build-release.sh`.
 
 ```sh
 cargo build --release --locked -p exnode     # target/release/exnode
@@ -67,6 +77,8 @@ cargo test --workspace --locked
 | `crates/ex-common` | Node identity (Ed25519) and the job types the agent and the hub share |
 | `packaging/` | The systemd unit, sysusers and tmpfiles entries, and the default `node.toml` |
 | `scripts/install.sh` | The installer each release ships |
+| `scripts/build-release.sh` | The reproducible release build, shared by CI and `ex_release_rebuild` |
+| `scripts/release-check.fish` | `ex_release_check` (signature, checksums, provenance) and `ex_release_rebuild` |
 | `node.example.toml` | Every configuration key, explained |
 
 ## Contributing
