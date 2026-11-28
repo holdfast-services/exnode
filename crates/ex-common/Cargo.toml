@@ -15,4 +15,5 @@ rand         = { workspace = true }
 thiserror    = { workspace = true }
 anyhow       = { workspace = true }
 chrono       = { workspace = true }
+chrono-tz    = { workspace = true }
 uuid         = { workspace = true }

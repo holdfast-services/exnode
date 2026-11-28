@@ -4,6 +4,21 @@
 # provenance and published to GitHub Releases with the packaging files and a
 # stamped install.sh.
 #
+# Each release also carries one provider bundle per architecture, the same for
+# every accelerator (NVIDIA, AMD, Tenstorrent; exnode never touches the GPU):
+#   exnode-linux-x86_64.tar.gz   exnode-linux-aarch64.tar.gz
+# Each extracts to exnode/ with the binary, the stamped install.sh, the
+# systemd, sysusers and tmpfiles files, node.toml.example, README.txt,
+# THIRD-PARTY-NOTICES.txt, and a SHA256SUMS over those with its own Sigstore
+# bundle (SHA256SUMS.sigstore.json, signed by this workflow at the tag), which
+# install.sh checks in bundle mode.  The release's SHA256SUMS covers the
+# tarballs too, and each tarball has its own .sigstore.json like every asset.
+#
+# The asset names carry no version on purpose, so that
+#   https://github.com/{repo}/releases/latest/download/exnode-linux-x86_64.tar.gz
+# always fetches the newest release (GitHub's "latest" skips pre-releases).
+# Keep them stable: the hub's install page and packaging/README.md link them.
+#
 # Every action is pinned to a full commit SHA (tag in the comment), resolved
 # with `git ls-remote` on 2026-11-04.  zig and cargo-zigbuild come from PyPI
 # by exact version and sha256 (scripts/zig-requirements.txt).  No caches: a
@@ -22,15 +37,11 @@
 # Tags with a suffix (v0.1.0-rc.1) publish as GitHub pre-releases, which
 # /releases/latest and so install.sh's default never pick.
 #
-# Checked locally on 2026-11-25 (not on a GitHub runner):
-#   - zig 0.17.0 + cargo-zigbuild 0.24.1 link both targets, including ring for
-#     aarch64-musl; both binaries are static
-#   - builds are byte-identical across source paths and CARGO_HOMEs
-# Not verified until the workflow first runs:
-#   - the inputs of actions at these SHAs (written against their documented
-#     inputs; upload-artifact v7 / download-artifact v8 interoperate)
-#   - attestations on a private repository need a plan that supports them
-#   - cosign v3 writes and verifies the Sigstore bundle format with --bundle
+# Run on GitHub for v0.1.0-rc.1 and v0.1.0 (2026-11-25): both targets built
+# byte-identical on separate runners and matched local builds; cosign v3
+# bundles and the provenance attestation were made and verified.
+# Not yet run on a runner: the bundle steps (packaging/bundle.sh and
+# notices.py were run locally with scripts/dev.fish ex_bundle, unsigned).
 
 name: release
 
@@ -90,10 +101,15 @@ jobs:
           sha256sum "dist/exnode-$TARGET"
           if [ "$TARGET" = x86_64-unknown-linux-musl ]; then "dist/exnode-$TARGET" --version; fi
 
+      - name: Third-party notices (from the crates this build just used)
+        run: python3 -I packaging/notices.py "$TARGET" > "dist/THIRD-PARTY-NOTICES-$TARGET.txt"
+
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: exnode-${{ matrix.target }}-${{ matrix.builder }}
-          path: dist/exnode-${{ matrix.target }}
+          path: |
+            dist/exnode-${{ matrix.target }}
+            dist/THIRD-PARTY-NOTICES-${{ matrix.target }}.txt
           if-no-files-found: error
           retention-days: 3
 
@@ -131,7 +147,11 @@ jobs:
           done
           rm -rf rebuild
 
-      - name: Assemble the release files and SHA256SUMS
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.1.4
+
+      - name: Assemble the release files, the bundles and SHA256SUMS
         env:
           REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
@@ -144,15 +164,23 @@ jobs:
           sed -e "/^REPO=/s|@REPO@|$REPO|" -e "/^VERSION=/s|@VERSION@|$TAG|" scripts/install.sh > dist/install.sh
           grep -qx "REPO=\"\${EXNODE_REPO:-$REPO}\"" dist/install.sh
           grep -qx "VERSION=\"\${EXNODE_VERSION:-$TAG}\"" dist/install.sh
+          chmod 0755 dist/exnode-*-linux-musl
+          # one bundle per architecture: stage, sign its SHA256SUMS, pack
+          export SOURCE_DATE_EPOCH=$(git log -1 --format=%ct 2>/dev/null || echo 0)
+          for arch in x86_64 aarch64; do
+            target=$arch-unknown-linux-musl
+            stage="$RUNNER_TEMP/bundle-$arch"
+            sh packaging/bundle.sh stage "$stage" "dist/exnode-$target" dist/install.sh \
+              "dist/THIRD-PARTY-NOTICES-$target.txt"
+            cosign sign-blob --yes --bundle "$stage/exnode/SHA256SUMS.sigstore.json" "$stage/exnode/SHA256SUMS"
+            sh packaging/bundle.sh pack "$stage" "dist/exnode-linux-$arch.tar.gz"
+          done
           cd dist
-          chmod 0755 exnode-*-linux-musl
           sha256sum exnode-x86_64-unknown-linux-musl exnode-aarch64-unknown-linux-musl \
-            exnode.service exnode.sysusers exnode.tmpfiles node.toml install.sh > SHA256SUMS
+            exnode.service exnode.sysusers exnode.tmpfiles node.toml install.sh \
+            THIRD-PARTY-NOTICES-x86_64-unknown-linux-musl.txt THIRD-PARTY-NOTICES-aarch64-unknown-linux-musl.txt \
+            exnode-linux-x86_64.tar.gz exnode-linux-aarch64.tar.gz > SHA256SUMS
           cat SHA256SUMS
-
-      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
-        with:
-          cosign-release: v3.1.4
 
       - name: Sign every file keylessly (one Sigstore bundle each)
         working-directory: dist
@@ -170,12 +198,24 @@ jobs:
             --certificate-identity "$IDENTITY" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com SHA256SUMS
           sha256sum -c SHA256SUMS
+          # each bundle as install.sh checks it in bundle mode
+          for arch in x86_64 aarch64; do
+            check="$RUNNER_TEMP/check-$arch"
+            mkdir "$check" && tar -C "$check" -xzf "exnode-linux-$arch.tar.gz"
+            cosign verify-blob --bundle "$check/exnode/SHA256SUMS.sigstore.json" \
+              --certificate-identity "$IDENTITY" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com "$check/exnode/SHA256SUMS"
+            (cd "$check/exnode" && sha256sum --strict -c SHA256SUMS)
+            for f in exnode install.sh; do [ -x "$check/exnode/$f" ] || { echo "::error::$f is not executable in the $arch bundle"; exit 1; }; done
+          done
 
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: |
             dist/exnode-x86_64-unknown-linux-musl
             dist/exnode-aarch64-unknown-linux-musl
+            dist/exnode-linux-x86_64.tar.gz
+            dist/exnode-linux-aarch64.tar.gz
             dist/install.sh
             dist/SHA256SUMS
 
@@ -207,7 +247,13 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           cat > notes.md <<EOF
-          Install: download \`install.sh\`, read it, then \`sudo sh install.sh\`. Do not pipe it into a shell.
+          Install in three steps (use \`aarch64\` in place of \`x86_64\` on 64-bit ARM):
+
+              curl -fsSLO https://github.com/$REPO/releases/latest/download/exnode-linux-x86_64.tar.gz && tar xzf exnode-linux-x86_64.tar.gz
+              sudo ./exnode/install.sh
+              # then answer the setup questions
+
+          Or download \`install.sh\` alone, read it, then \`sudo sh install.sh\`. Do not pipe it into a shell.
 
           Verify by hand (cosign v3):
 

@@ -100,9 +100,11 @@ impl HubClient {
         Ok(v)
     }
 
-    pub async fn heartbeat(&self) -> Result<String> {
+    /// Tell the hub the node is alive and what it is doing about the exchange (`availability`:
+    /// serving or off duty, and how much it will take).
+    pub async fn heartbeat(&self, availability: &Value) -> Result<String> {
         let path = format!("/v0/nodes/{}/heartbeat", self.node_id);
-        let (status, v) = self.send(Method::POST, &path, Some(&json!({}))).await?;
+        let (status, v) = self.send(Method::POST, &path, Some(&json!({"availability": availability}))).await?;
         if !status.is_success() {
             bail!("heartbeat failed ({status}): {}", Self::error_text(&v));
         }
@@ -123,9 +125,15 @@ impl HubClient {
         }
     }
 
-    pub async fn stream_chunk(&self, job_id: &str, seq: u64, deltas: &[String]) -> Result<(), HubError> {
+    pub async fn stream_chunk(
+        &self, job_id: &str, seq: u64, deltas: &[String], calls: &[ex_common::models::ToolCall],
+    ) -> Result<(), HubError> {
         let path = format!("/v0/jobs/{job_id}/stream");
-        let (status, v) = self.send(Method::POST, &path, Some(&json!({"seq": seq, "deltas": deltas}))).await?;
+        let mut body = json!({"seq": seq, "deltas": deltas});
+        if !calls.is_empty() {
+            body["tool_calls"] = json!(calls);
+        }
+        let (status, v) = self.send(Method::POST, &path, Some(&body)).await?;
         let gone = match status {
             StatusCode::FORBIDDEN | StatusCode::NOT_FOUND => true,
             StatusCode::CONFLICT => Self::error_text(&v).contains("not running"),
@@ -150,7 +158,7 @@ impl HubClient {
         Ok(v)
     }
 
-    /// Public market feed: demand multipliers, unmet requests and bounties.
+    /// Public market feed: queues, prices, unmet requests and bounties.
     pub async fn market(&self) -> Result<Value> {
         let resp = self.client.get(format!("{}/v0/market", self.base)).send().await.context("hub /v0/market")?;
         if !resp.status().is_success() {

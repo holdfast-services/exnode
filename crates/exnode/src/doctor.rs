@@ -23,7 +23,8 @@ use crate::{
     keyfile,
 };
 
-fn line(level: Level, what: &str, detail: &str) {
+/// One report line, as `doctor` and `setup` print them.
+pub fn line(level: Level, what: &str, detail: &str) {
     let tag = match level {
         Level::Ok     => "ok",
         Level::Info   => "info",
@@ -85,6 +86,18 @@ pub async fn run(config_path: &str) -> Result<bool> {
         }
     }
 
+    match cfg.duty_schedule() {
+        Err(e) => note(Level::Fail, "schedule", &e.to_string()),
+        Ok(s) => {
+            let now = chrono::Utc::now();
+            let control = crate::duty::Control::load(&crate::duty::Control::path_for(&cfg.key_file));
+            let duty = crate::duty::evaluate(&s, cfg.max_concurrency, &control, true, now);
+            let what = if s.is_always() { "always on" } else { "weekly schedule" };
+            note(Level::Info, "schedule", &format!("{what}, read on {}", s.zone().describe(now)));
+            note(Level::Info, "duty now", &duty.sentence(s.zone()));
+        }
+    }
+
     let kind    = cfg.backend_kind()?;
     let backend = Backend::new(kind, &cfg.backend_url(), cfg.backend_api_key());
     let shown   = format!("{} at {}", cfg.backend, display_url(&cfg.backend_url()));
@@ -134,7 +147,7 @@ pub async fn run(config_path: &str) -> Result<bool> {
 
 /// Whether the hub answers `GET /health`, on the same terms as the agent's
 /// own client: https unless on localhost, no redirects.
-async fn hub_health(url: &str) -> Result<()> {
+pub async fn hub_health(url: &str) -> Result<()> {
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(10))

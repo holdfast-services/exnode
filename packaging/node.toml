@@ -1,5 +1,6 @@
-# /etc/exnode/node.toml: exnode as a systemd service.  Every key is explained
-# in node.example.toml.  This file is root:exnode, mode 0640: the agent can
+# /etc/exnode/node.toml: exnode as a systemd service.  `sudo exnode setup`
+# writes this file from your answers; edit it by hand only if you prefer.
+# Every key is explained in node.example.toml.  This file is root:exnode, mode 0640: the agent can
 # read it and cannot change it.  It holds no secret: enroll with
 # `exnode init --token ...` (the token is never saved), and put a backend API
 # key in /etc/exnode/exnode.env (root, 0600).
@@ -19,6 +20,16 @@ backend_url = "http://127.0.0.1:11434"
 heartbeat_secs  = 15
 poll_secs       = 20
 max_concurrency = 2
+
+# When to serve.  Outside its schedule the agent takes no jobs but keeps
+# heartbeating, and tells the exchange it is off duty; a job already running
+# finishes.  The simple form is one daily window in local time (it may cross
+# midnight); absent or "": always.
+# serve_hours = "18:00-08:00"
+#
+# For a weekly schedule, a share of the machine, a time zone or blackout dates,
+# see node.example.toml ([[schedule]], timezone, [blackout]) and check the result
+# with `exnode schedule`.
 
 # One block per model, "name" exactly as the backend knows it.  With the
 # openai backend, also set "hash" (sha256:<digest of the weights you serve>).

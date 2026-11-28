@@ -20,6 +20,10 @@ The hub is operated by Holdfast Services LLC and is not part of this repository.
   network. The list of checks is in `crates/exnode/src/advisories.rs`.
 - The systemd unit runs it as an unprivileged user with no capabilities, on a read-only
   filesystem, with the usual model directories hidden from it.
+- You decide how much of the machine the exchange gets, and when: a weekly schedule with a share
+  of the machine for each window, a time zone, blackout dates, and `exnode pause`. The limits are
+  yours and live in `node.toml`; the exchange is told what the node is doing and is never in
+  charge of it.
 
 [packaging/README.md](packaging/README.md) explains each of these in detail.
 
