@@ -28,6 +28,43 @@ poll_secs = 20
 # Maximum concurrent inference jobs
 max_concurrency = 2
 
+# ── When, and how much ───────────────────────────────────────────────────────
+# `max_concurrency` above is what this machine can run at full capacity. A weekly
+# schedule says when it brings that capacity to the exchange and how much of it.
+# Rules are read in order and the first that covers a moment decides it. No match
+# means off; no rules at all means on, in full, all the time. A window may cross
+# midnight, and its morning belongs to the day it started on. Check what you
+# wrote, over the next seven days, with `exnode schedule`.
+#
+# The clock: a zone name (a datacenter server is usually on UTC). Absent: this
+# machine's local time.
+# timezone = "America/Chicago"
+#
+# Nights on weekdays in full, weekends at half:
+# [[schedule]]
+# days  = ["weekdays"]          # mon … sun, weekdays, weekends; absent: every day
+# hours = "18:00-08:00"         # 24-hour; or "all day"
+# share = 100                   # percent of max_concurrency (rounded up, at least 1)
+#
+# [[schedule]]
+# days  = ["weekends"]
+# hours = "all day"
+# share = 50
+#
+# Dates when nothing is served, whatever the schedule says:
+# [blackout]
+# dates = ["2026-12-24..2027-01-02", "2027-07-04"]
+#
+# `serve_hours = "18:00-08:00"` is the one-line form: one window, every day, in
+# full. Use it or [[schedule]], not both.
+#
+# Outside its schedule the node keeps heartbeating, and says so: the exchange
+# does not count a node that is off duty as supply, and tells a buyer when the
+# next window opens. Every limit is yours and is set here, on this machine; the
+# exchange is told and never in charge. To stop at once, `exnode pause` (or
+# `exnode pause --for 2h`); `exnode resume` ends it. A job already running
+# finishes either way.
+
 # Models to advertise and serve. "name" must match the backend's model name.
 # "hash" is fetched from Ollama when empty; the openai backend requires it.
 # Your trust tier is set by the hub, not here.
@@ -43,6 +80,18 @@ max_concurrency = 2
 [[models]]
 name    = "qwen3:30b"
 context = 32768
+
+# Tool use (function calling).  Add `tools = true` to a model whose engine takes
+# OpenAI-style tools and returns the calls the model makes: Ollama with a model
+# whose template supports tools, vLLM started with --enable-auto-tool-choice and a
+# --tool-call-parser for the model, llama-server started with --jinja.  The hub
+# sends tool-use jobs only to nodes that say so, and tests them on it with
+# hidden tool prompts, so leave it off unless you have tried it.
+#
+# [[models]]
+# name    = "qwen3:30b"
+# context = 32768
+# tools   = true
 
 # Example for an OpenAI-compatible server:
 # [[models]]

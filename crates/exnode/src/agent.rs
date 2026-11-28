@@ -16,31 +16,46 @@
 //! [`checks::CHECK_INTERVAL`].  A failing check stops it asking the hub for
 //! jobs (heartbeats go on) until the checks pass again; a job already taken
 //! finishes.
+//!
+//! With `serve_hours` set ([`crate::hours`]) the agent asks for jobs only
+//! inside that daily window, in local time.  Outside it, heartbeats go on and
+//! a job already taken finishes, the same as a failing safety check.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
+    path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::Result;
+use chrono::Utc;
 use ed25519_dalek::SigningKey;
 use serde_json::{json, Value};
-use tokio::sync::{mpsc, watch, Semaphore};
+use tokio::sync::{mpsc, watch};
 use tracing::{error, info, warn};
 
 use ex_common::identity::{canonical, sha256_hex, sign};
-use ex_common::models::{effective_context, JobReceipt, FAIL_CONTEXT_EXCEEDED};
+use ex_common::schedule::Schedule;
+use ex_common::models::{answer_text, effective_context, JobReceipt, ToolCall, FAIL_CONTEXT_EXCEEDED};
 
 use crate::{
-    backend::{Backend, BackendKind, GenError},
+    backend::{Backend, BackendKind, ChatJob, GenError, ToolOffer},
     checks::{self, Level, Report},
     config::NodeConfig,
+    duty::{self, Control, Duty, Limiter},
     hub_client::{HubClient, HubError},
 };
+
+/// How often the duty is worked out again: the schedule, the pause file and the safety checks.
+const DUTY_TICK: Duration = Duration::from_secs(5);
+
+/// How often a node tells the hub it is still working while the model reasons
+/// and no text flows.  Well inside the hub's stall timeout (60 s).
+const ALIVE_EVERY: Duration = Duration::from_secs(15);
 
 /// Deltas sent per stream request at most.
 const MAX_BATCH: usize = 256;
@@ -48,16 +63,19 @@ const MAX_BATCH: usize = 256;
 const MARKET_INTERVAL: Duration = Duration::from_secs(300);
 
 /// Log lines summarising the market for an operator: the models this node
-/// serves, then up to three in-demand models it doesn't.
+/// serves, then up to three in-demand models it doesn't.  A model's price
+/// floats under its list price: `price.factor` is the share of list it sells
+/// (and pays) at now, 1 when the hub doesn't say.
 pub fn market_report(market: &Value, served: &[&str]) -> Vec<String> {
     let describe = |m: &Value| {
         let mut s = format!(
-            "{}: {}x demand, {} nodes, queue {}",
+            "{}: {} nodes, queue {}",
             m["model"].as_str().unwrap_or("?"),
-            m["demand_multiplier"].as_str().unwrap_or("1"),
             m["active_nodes"].as_u64().unwrap_or(0),
             m["queue"].as_str().unwrap_or("?"),
         );
+        let factor = m["price"]["factor"].as_str().and_then(|f| f.parse::<f64>().ok()).unwrap_or(1.0);
+        if factor < 1.0 { s += &format!(", paying {}% of list", (factor * 100.0).round()); }
         let unmet = m["unmet_requests_1h"].as_u64().unwrap_or(0);
         if unmet > 0 { s += &format!(", {unmet} turned away in the last hour"); }
         if let Some(rate) = m["bounty"]["bonus_rate"].as_str() {
@@ -72,8 +90,7 @@ pub fn market_report(market: &Value, served: &[&str]) -> Vec<String> {
         .collect();
     let wanted: Vec<String> = models.iter()
         .filter(|m| !served.contains(&m["model"].as_str().unwrap_or("")))
-        .filter(|m| m["demand_multiplier"].as_str() != Some("1")
-            || m["unmet_requests_1h"].as_u64().unwrap_or(0) > 0
+        .filter(|m| m["unmet_requests_1h"].as_u64().unwrap_or(0) > 0
             || !m["bounty"].is_null())
         .take(3)
         .map(|m| format!("market (in demand elsewhere) {}", describe(m)))
@@ -106,8 +123,12 @@ pub struct Agent {
     /// The context window each model runs in: what is advertised for it
     /// (4,096 when advertised as 0, as the hub takes it).
     windows:      HashMap<String, u32>,
+    /// The models whose engine takes tools (`tools = true` in node.toml).
+    tool_models:  HashSet<String>,
     /// Run the safety checks before serving and while serving.
     safety_checks: bool,
+    /// How often the duty is worked out again.
+    duty_tick:    Duration,
 }
 
 impl Agent {
@@ -129,7 +150,14 @@ impl Agent {
             model_hashes.insert(m.name.clone(), hash);
         }
         let windows = cfg.models.iter().map(|m| (m.name.clone(), effective_context(m.context))).collect();
-        Ok(Self { cfg, hub, backend, sk, model_hashes, windows, safety_checks: false })
+        let tool_models = cfg.models.iter().filter(|m| m.tools).map(|m| m.name.clone()).collect();
+        Ok(Self { cfg, hub, backend, sk, model_hashes, windows, tool_models, safety_checks: false, duty_tick: DUTY_TICK })
+    }
+
+    /// Work out the duty this often instead of every few seconds (tests).
+    pub fn with_duty_tick(mut self, every: Duration) -> Self {
+        self.duty_tick = every;
+        self
     }
 
     /// Check the backend and host before serving and every
@@ -154,6 +182,7 @@ impl Agent {
             "name":    m.name,
             "hash":    self.model_hashes[&m.name],
             "context": m.context,
+            "tools":   m.tools,
         })).collect()
     }
 
@@ -185,21 +214,31 @@ impl Agent {
         // Checked before the hub hears of us: a refused node never registers.
         let first = if self.safety_checks { Some(self.preflight().await?) } else { None };
         self.register(&public_key_b64).await?;
-        let agent = Arc::new(self);
-        let sem   = Arc::new(Semaphore::new(agent.cfg.max_concurrency));
+        let agent    = Arc::new(self);
+        let schedule = Arc::new(agent.cfg.duty_schedule()?);
+        let max      = agent.cfg.max_concurrency;
 
-        // Open while the safety checks pass; the job loops wait on it.
-        let gate = first.map(|report| {
+        // The job loops ask for work only while the node is on duty: the safety checks pass, it is not
+        // paused, and the schedule has a window now.  How many jobs at once follows the window's share.
+        let safety = first.map(|report| {
             let (tx, rx) = watch::channel(true);
             tokio::spawn(watch_safety(agent.clone(), tx, report));
             rx
         });
+        let control_path = Control::path_for(&agent.cfg.key_file);
+        let start = duty::evaluate(&schedule, max, &Control::load(&control_path), safety.as_ref().is_none_or(|r| *r.borrow()), Utc::now());
+        info!("{}", start.sentence(schedule.zone()));
+        let (duty_tx, duty_rx) = watch::channel(start);
+        tokio::spawn(watch_duty(schedule.clone(), max, control_path, safety, duty_tx, agent.duty_tick));
 
+        // The hub is told the duty with every heartbeat, so it can tell a machine that is off duty from one that is idle.
         let hb = agent.clone();
+        let hb_duty = duty_rx.clone();
         tokio::spawn(async move {
             let mut last = String::new();
             loop {
-                match hb.hub.heartbeat().await {
+                let availability = hb_duty.borrow().to_json();
+                match hb.hub.heartbeat(&availability).await {
                     Ok(status) => {
                         if status != last { info!(%status, "node status"); last = status; }
                     }
@@ -209,7 +248,7 @@ impl Agent {
             }
         });
 
-        // Market watch: tell the operator where demand and bounties are.
+        // Market watch: tell the operator where demand, pay and bounties are.
         let mk = agent.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(10)).await;
@@ -227,31 +266,29 @@ impl Agent {
             }
         });
 
+        let limiter = Arc::new(Limiter::default());
         let mut loops = Vec::new();
         for model in agent.cfg.models.iter().map(|m| m.name.clone()) {
-            let a   = agent.clone();
-            let sem = sem.clone();
-            let mut gate = gate.clone();
+            let a       = agent.clone();
+            let limiter = limiter.clone();
+            let mut duty = duty_rx.clone();
             loops.push(tokio::spawn(async move {
                 loop {
-                    if let Some(g) = gate.as_mut() {
-                        if g.wait_for(|open| *open).await.is_err() {
-                            error!(%model, "refusing to serve: the safety checks stopped running");
-                            return;
-                        }
-                    }
-                    let permit = sem.clone().acquire_owned().await.expect("semaphore closed");
+                    let Some(place) = limiter.acquire(&mut duty).await else {
+                        error!(%model, "refusing to serve: the duty watcher stopped running");
+                        return;
+                    };
                     match a.hub.next_job(&model, a.cfg.poll_secs).await {
-                        Ok(None) => drop(permit),
+                        Ok(None) => drop(place),
                         Ok(Some(job)) => {
                             let a2 = a.clone();
                             tokio::spawn(async move {
-                                let _permit = permit;
+                                let _place = place;
                                 a2.handle_job(job).await;
                             });
                         }
                         Err(e) => {
-                            drop(permit);
+                            drop(place);
                             warn!(%model, "poll failed: {e}");
                             tokio::time::sleep(Duration::from_secs(5)).await;
                         }
@@ -262,8 +299,8 @@ impl Agent {
         for l in loops {
             l.await?;
         }
-        // the loops end only when the safety checks stopped: let the service manager restart us
-        anyhow::bail!("stopped serving: the safety checks stopped running")
+        // the loops end only when the duty watcher stopped: let the service manager restart us
+        anyhow::bail!("stopped serving: the duty watcher stopped running")
     }
 
     async fn handle_job(&self, job: Value) {
@@ -276,20 +313,50 @@ impl Agent {
             let _ = self.hub.fail_job(&job_id, "model not served by this node").await;
             return;
         };
+        // a job that offers tools, or continues a conversation that has calls in it, needs an engine set up for them
+        let tools = job["tools"].is_array().then(|| (job["tools"].clone(), job["tool_choice"].clone()));
+        let has_tool_messages = messages.iter().any(|m| {
+            m["role"].as_str() == Some("tool") || m["tool_calls"].as_array().is_some_and(|c| !c.is_empty())
+        });
+        if (tools.is_some() || has_tool_messages) && !self.tool_models.contains(&model) {
+            let _ = self.hub.fail_job(&job_id, "tool use is not enabled for this model on this node").await;
+            return;
+        }
         info!(%job_id, %model, "job started");
 
-        let (tx, rx)  = mpsc::unbounded_channel::<String>();
+        let (tx, rx)  = mpsc::unbounded_channel::<Out>();
         let cancelled = Arc::new(AtomicBool::new(false));
         let forwarder = tokio::spawn(forward(self.hub.clone(), job_id.clone(), rx, cancelled.clone()));
 
         let mut output = String::new();
-        let generated = self.backend.chat_stream(&model, &messages, &params, max_tokens, window, |delta| {
+        let offer = tools.as_ref().map(|(tools, choice)| ToolOffer { tools, choice });
+        let request = ChatJob { model: &model, messages: &messages, params: &params, tools: offer, max_tokens, window };
+        let mut last_alive = Instant::now();
+        let generated = self.backend.chat_stream(&request, |delta| {
             if cancelled.load(Ordering::Relaxed) {
                 return false;
             }
+            if delta.is_empty() {
+                // reasoning before the answer: tell the hub now and then, so its
+                // stall timer does not take a thinking model for a dead node
+                if last_alive.elapsed() < ALIVE_EVERY {
+                    return true;
+                }
+                last_alive = Instant::now();
+                return tx.send(Out::Alive).is_ok();
+            }
+            last_alive = Instant::now();
             output.push_str(delta);
-            tx.send(delta.to_string()).is_ok()
+            tx.send(Out::Text(delta.to_string())).is_ok()
         }).await;
+        // the model's calls go last, whole, once the text is out
+        let calls: Vec<ToolCall> = match &generated {
+            Ok(g) if !g.cancelled => g.tool_calls.clone(),
+            _ => Vec::new(),
+        };
+        if !calls.is_empty() {
+            let _ = tx.send(Out::Calls(calls.clone()));
+        }
         drop(tx);
         let forwarded = forwarder.await.unwrap_or_else(|e| Err(HubError::Other(e.into())));
 
@@ -317,10 +384,12 @@ impl Agent {
                 let receipt = JobReceipt {
                     job_id:        job_id.clone(),
                     node_id:       self.hub.node_id().to_string(),
-                    output_sha256: sha256_hex(output.as_bytes()),
+                    // the text and the calls, as the hub builds the same string from what it was sent
+                    output_sha256: sha256_hex(answer_text(&output, &calls).as_bytes()),
                     model_hash,
                     output_tokens: gen.output_tokens,
                     prompt_tokens: gen.prompt_tokens,
+                    cached_input_tokens: gen.cached_tokens.min(gen.prompt_tokens),
                 };
                 let (receipt, signature) = match signed_receipt(&self.sk, &receipt) {
                     Ok(r)  => r,
@@ -338,6 +407,34 @@ impl Agent {
                 }
             }
         }
+    }
+}
+
+/// Keep the duty up to date for as long as the agent runs: every [`DUTY_TICK`], look at the schedule, the
+/// pause file and the safety checks, and publish the duty when it changes.  A change is logged once; a
+/// change of only the time of the next change (the schedule moving on to its next window) is not news.
+async fn watch_duty(
+    schedule: Arc<Schedule>, max: usize, control_path: PathBuf, safety: Option<watch::Receiver<bool>>, tx: watch::Sender<Duty>,
+    tick: Duration,
+) {
+    let zone = schedule.zone();
+    loop {
+        tokio::time::sleep(tick).await;
+        if tx.is_closed() {
+            return;
+        }
+        let ok = safety.as_ref().is_none_or(|r| *r.borrow());
+        let duty = duty::evaluate(&schedule, max, &Control::load(&control_path), ok, Utc::now());
+        tx.send_if_modified(|cur| {
+            if *cur == duty {
+                return false;
+            }
+            if (cur.state, cur.capacity) != (duty.state, duty.capacity) {
+                info!("{}", duty.sentence(zone));
+            }
+            *cur = duty.clone();
+            true
+        });
     }
 }
 
@@ -375,26 +472,47 @@ async fn watch_safety(agent: Arc<Agent>, gate: watch::Sender<bool>, first: Repor
     }
 }
 
+/// What the backend produced, in order, for the hub.
+enum Out {
+    /// A piece of the answer's text.
+    Text(String),
+    /// The calls the model made, whole.
+    Calls(Vec<ToolCall>),
+    /// The model is reasoning: nothing to show yet, but the node is not silent.
+    Alive,
+}
+
+/// Add what the backend produced to the chunk being built.
+fn absorb(out: Out, batch: &mut Vec<String>, calls: &mut Vec<ToolCall>) {
+    match out {
+        Out::Text(t)  => batch.push(t),
+        Out::Calls(c) => calls.extend(c),
+        // an empty chunk is the whole message: the hub counts it as progress
+        Out::Alive    => {}
+    }
+}
+
 /// Send output deltas to the hub in order, batching whatever has queued up
 /// while the previous request was in flight.  Retries transient failures.
 async fn forward(
     hub: Arc<HubClient>,
     job_id: String,
-    mut rx: mpsc::UnboundedReceiver<String>,
+    mut rx: mpsc::UnboundedReceiver<Out>,
     cancelled: Arc<AtomicBool>,
 ) -> Result<(), HubError> {
     let mut seq = 0u64;
     while let Some(first) = rx.recv().await {
-        let mut batch = vec![first];
+        let (mut batch, mut calls) = (Vec::new(), Vec::new());
+        absorb(first, &mut batch, &mut calls);
         while batch.len() < MAX_BATCH {
             match rx.try_recv() {
-                Ok(d)  => batch.push(d),
-                Err(_) => break,
+                Ok(next) => absorb(next, &mut batch, &mut calls),
+                Err(_)   => break,
             }
         }
         let mut attempt = 0;
         loop {
-            match hub.stream_chunk(&job_id, seq, &batch).await {
+            match hub.stream_chunk(&job_id, seq, &batch, &calls).await {
                 Ok(()) => break,
                 Err(HubError::JobGone) => {
                     cancelled.store(true, Ordering::Relaxed);
@@ -428,9 +546,11 @@ mod tests {
         let receipt = JobReceipt {
             job_id: "j1".into(), node_id: "n1".into(), output_sha256: sha256_hex(b"hi"),
             model_hash: "sha256:abc".into(), output_tokens: 1, prompt_tokens: 17,
+            cached_input_tokens: 9,
         };
         let (value, sig) = signed_receipt(&sk, &receipt).unwrap();
         assert_eq!(value["prompt_tokens"], 17);
+        assert_eq!(value["cached_input_tokens"], 9, "signed with the rest");
         verify_signature(&pk_b64, &canonical(&value), &sig).unwrap();
         // a hub that changed the count would break the signature
         let mut forged = value.clone();
@@ -442,17 +562,18 @@ mod tests {
     fn market_report_covers_own_models_and_nudges_toward_demand() {
         let m = json!({
             "models": [
-                {"model": "llama4:70b", "demand_multiplier": "1", "active_nodes": 0, "queue": "empty", "unmet_requests_1h": 12, "bounty": null},
-                {"model": "qwen3:30b", "demand_multiplier": "1.5", "active_nodes": 3, "queue": "busy", "unmet_requests_1h": 0,
-                 "bounty": {"bonus_rate": "0.15"}},
-                {"model": "gemma3:12b", "demand_multiplier": "1", "active_nodes": 4, "queue": "empty", "unmet_requests_1h": 0, "bounty": null},
+                {"model": "llama4:70b", "active_nodes": 0, "queue": "empty", "unmet_requests_1h": 12, "bounty": null},
+                {"model": "qwen3:30b", "active_nodes": 3, "queue": "busy", "unmet_requests_1h": 0,
+                 "price": {"factor": "0.85"}, "bounty": {"bonus_rate": "0.15"}},
+                {"model": "gemma3:12b", "active_nodes": 4, "queue": "empty", "unmet_requests_1h": 0,
+                 "price": {"factor": "1"}, "bounty": null},
             ],
             "bounties": [{"model_pattern": "qwen3-coder*", "bonus_rate": "0.1"}],
         });
         let lines = market_report(&m, &["qwen3:30b"]);
         assert_eq!(lines, vec![
-            "market (serving) qwen3:30b: 1.5x demand, 3 nodes, queue busy, bounty +15%".to_string(),
-            "market (in demand elsewhere) llama4:70b: 1x demand, 0 nodes, queue empty, 12 turned away in the last hour".to_string(),
+            "market (serving) qwen3:30b: 3 nodes, queue busy, paying 85% of list, bounty +15%".to_string(),
+            "market (in demand elsewhere) llama4:70b: 0 nodes, queue empty, 12 turned away in the last hour".to_string(),
             "market bounty +10% for any qwen3-coder* model".to_string(),
         ]);
     }

@@ -3,7 +3,34 @@
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::backend::BackendKind;
+use ex_common::schedule::{parse_blackout, Rule, Schedule, Zone};
+
+use crate::{backend::BackendKind, hours::ServeHours};
+
+/// One line of the weekly schedule (`[[schedule]]` in node.toml): on these days, in this window,
+/// bring this share of the machine.  Rules are read in order and the first that covers a moment decides it.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ScheduleRule {
+    /// `mon` … `sun`, `weekdays`, `weekends`.  Empty or absent: every day.
+    #[serde(default)]
+    pub days: Vec<String>,
+    /// `18:00-08:00` (24-hour; a window may cross midnight, and its morning belongs to the day it
+    /// started on), or `all day`.
+    pub hours: String,
+    /// Percent of `max_concurrency` to bring in this window, 1 to 100.
+    #[serde(default = "full_share")]
+    pub share: u32,
+}
+
+fn full_share() -> u32 { 100 }
+
+/// Dates when nothing is served, whatever the schedule says (`[blackout]` in node.toml).
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct Blackout {
+    /// `2026-12-25`, or a span `2026-12-24..2027-01-02`.
+    #[serde(default)]
+    pub dates: Vec<String>,
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct NodeConfig {
@@ -48,6 +75,26 @@ pub struct NodeConfig {
     /// Maximum concurrent jobs.
     #[serde(default = "default_concurrency")]
     pub max_concurrency: usize,
+
+    /// Daily serving window in local time, e.g. "18:00-08:00" ([`ServeHours`]).
+    /// Outside it the agent takes no jobs but keeps heartbeating.  Empty or
+    /// absent: always.  A shorthand for one `[[schedule]]` rule on every day;
+    /// use one or the other, not both.
+    #[serde(default)]
+    pub serve_hours: Option<String>,
+
+    /// The clock the schedule is read on: a zone name such as `America/Chicago`.  Absent: this
+    /// machine's local time (a datacenter server is usually on UTC, so name the zone).
+    #[serde(default)]
+    pub timezone: Option<String>,
+
+    /// The weekly schedule: when to bring capacity to the exchange, and how much.
+    #[serde(default)]
+    pub schedule: Vec<ScheduleRule>,
+
+    /// Dates when nothing is served.
+    #[serde(default)]
+    pub blackout: Blackout,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -60,6 +107,13 @@ pub struct ModelConfig {
     /// Context window size in tokens.
     #[serde(default = "default_context")]
     pub context: u32,
+    /// The engine takes OpenAI-style `tools` for this model and returns the
+    /// calls the model makes: Ollama with a model whose template has tools,
+    /// vLLM started with `--enable-auto-tool-choice --tool-call-parser …`,
+    /// llama-server started with `--jinja`.  The hub sends tool-use jobs to a
+    /// node only if it says so, and tests it on it like any other claim.
+    #[serde(default)]
+    pub tools: bool,
 }
 
 fn default_backend()        -> String { "ollama".into() }
@@ -101,7 +155,36 @@ impl NodeConfig {
         if self.max_concurrency == 0 {
             bail!("max_concurrency must be at least 1");
         }
+        self.serve_window()?;
+        self.duty_schedule()?;
         Ok(())
+    }
+
+    /// When this machine serves and how much of it: `serve_hours` or the `[[schedule]]` rules, on
+    /// the configured clock, less the blackout dates.  With neither, always, in full.
+    pub fn duty_schedule(&self) -> Result<Schedule> {
+        let zone = Zone::parse(self.timezone.as_deref()).map_err(anyhow::Error::msg)?;
+        let hours = self.serve_hours.as_deref().map(str::trim).filter(|h| !h.is_empty());
+        if hours.is_some() && !self.schedule.is_empty() {
+            bail!("set serve_hours or [[schedule]] rules, not both: serve_hours is a shorthand for one rule on every day");
+        }
+        let mut rules = Vec::new();
+        if let Some(h) = hours {
+            // the old key's own parser says what it expects ("always" and empty mean no rule)
+            if ServeHours::parse(h).map_err(anyhow::Error::msg)?.is_some() {
+                rules.push(Rule::parse(&[], h, 100).map_err(anyhow::Error::msg)?);
+            }
+        }
+        for (i, r) in self.schedule.iter().enumerate() {
+            rules.push(Rule::parse(&r.days, &r.hours, r.share).map_err(|e| anyhow::anyhow!("[[schedule]] rule {}: {e}", i + 1))?);
+        }
+        let blackout = parse_blackout(&self.blackout.dates).map_err(anyhow::Error::msg)?;
+        Schedule::new(zone, rules, blackout).map_err(anyhow::Error::msg)
+    }
+
+    /// The serving window, `None` for always.
+    pub fn serve_window(&self) -> Result<Option<ServeHours>> {
+        ServeHours::parse(self.serve_hours.as_deref().unwrap_or("")).map_err(anyhow::Error::msg)
     }
 
     pub fn backend_kind(&self) -> Result<BackendKind> { self.backend.parse() }
@@ -147,6 +230,24 @@ mod tests {
         assert_eq!(display_url("https://user:pw@hub.example.com/x?token=abc#f"), "https://hub.example.com/x");
         assert_eq!(display_url("http://127.0.0.1:11434"), "http://127.0.0.1:11434/");
         assert_eq!(display_url("not a url"), "(not a valid URL)");
+    }
+
+    fn minimal(extra: &str) -> Result<NodeConfig> {
+        let cfg: NodeConfig = toml::from_str(&format!(
+            "hub_url = \"https://hub.example.com\"\nkey_file = \"k\"\n{extra}\n[[models]]\nname = \"m\"\n"))?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    #[test]
+    fn serve_hours_are_optional_and_validated() {
+        assert_eq!(minimal("").unwrap().serve_window().unwrap(), None);
+        assert_eq!(minimal("serve_hours = \"\"").unwrap().serve_window().unwrap(), None);
+        let w = minimal("serve_hours = \"18:00-08:00\"").unwrap().serve_window().unwrap().unwrap();
+        assert_eq!(w.to_string(), "18:00-08:00");
+        let e = minimal("serve_hours = \"6pm-8am\"").unwrap_err().to_string();
+        assert!(e.contains("serve_hours"), "{e}");
+        assert!(minimal("serve_hours = \"08:00-08:00\"").is_err());
     }
 
     #[test]
